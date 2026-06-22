@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { io } from 'socket.io-client';
 import { supabase, isSupabaseConfigured } from './utils/supabase';
 import './styles.css';
 
@@ -44,7 +45,26 @@ function buildQueueViewState(snapshot = {}, presenceState = {}) {
     ? snapshot.history.map((token) => Number(token)).filter((token) => Number.isInteger(token) && token > 0)
     : [];
   const currentToken = normalizeTokenValue(snapshot.currentToken);
-  const activePatients = derivePatientsFromPresence(presenceState, currentToken);
+  const activePatients = Array.isArray(snapshot.activePatients) && snapshot.activePatients.length > 0
+    ? snapshot.activePatients
+        .map((patient) => {
+          const token = normalizeTokenValue(patient?.token);
+          if (token === null) return null;
+
+          const tokensAhead = Number.isFinite(patient?.tokensAhead)
+            ? Math.max(Number(patient.tokensAhead), 0)
+            : Number.isFinite(currentToken)
+              ? Math.max(token - currentToken, 0)
+              : null;
+
+          return {
+            token,
+            tokensAhead,
+            status: patient?.status ?? 'waiting',
+          };
+        })
+        .filter(Boolean)
+    : derivePatientsFromPresence(presenceState, currentToken);
 
   return {
     currentToken,
@@ -196,6 +216,7 @@ function App() {
   const [notificationEnabled, setNotificationEnabled] = useState('Notification' in window ? Notification.permission : 'unsupported');
   const lastAlertRef = useRef({ token: null, current: null, near: false });
   const channelRef = useRef(null);
+  const socketRef = useRef(null);
   const presenceStateRef = useRef({});
   const queueStateRef = useRef(queueState);
   const patientTokenRef = useRef(patientToken);
@@ -215,76 +236,148 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!isSupabaseConfigured) return undefined;
-
     let alive = true;
-    const clientId = getClientId();
-    const channel = supabase.channel('qalert-queue', {
-      config: {
-        presence: { key: clientId },
-      },
+
+    if (isSupabaseConfigured) {
+      const clientId = getClientId();
+      const channel = supabase.channel('qalert-queue', {
+        config: {
+          presence: { key: clientId },
+        },
+      });
+
+      channelRef.current = channel;
+
+      channel.on('postgres_changes', { event: '*', schema: 'public', table: QUEUE_TABLE }, (payload) => {
+        const nextSnapshot = payload.new?.state;
+        if (!alive || !nextSnapshot) return;
+        setQueueState(buildQueueViewState(nextSnapshot, presenceStateRef.current));
+      });
+
+      channel.on('presence', { event: 'sync' }, () => {
+        if (!alive) return;
+        const activePatients = derivePatientsFromPresence(channel.presenceState(), queueStateRef.current.currentToken);
+        presenceStateRef.current = channel.presenceState();
+        setQueueState((prev) => ({
+          ...prev,
+          activePatients,
+          activeCount: activePatients.length,
+        }));
+      });
+
+      const syncPatientPresence = async () => {
+        const token = normalizeTokenValue(patientTokenRef.current);
+        if (token === null) return;
+
+        try {
+          await channel.track({ tokenNumber: token, role: 'patient' });
+        } catch (error) {
+          console.error('Failed to track patient presence:', error);
+        }
+      };
+
+      const bootstrap = async () => {
+        try {
+          const snapshot = (await loadQueueSnapshot()) ?? createQueueViewState();
+          if (!alive) return;
+          setQueueState(buildQueueViewState(snapshot, presenceStateRef.current));
+
+          if (!snapshot.updatedAt) {
+            await persistQueueSnapshot(snapshot);
+          }
+        } catch (error) {
+          console.error('Failed to bootstrap queue state:', error);
+        }
+      };
+
+      bootstrap();
+
+      const pollSnapshot = async () => {
+        const snapshot = await loadQueueSnapshot();
+        if (!alive || !snapshot) return;
+        setQueueState((prev) => {
+          const nextView = buildQueueViewState(snapshot, presenceStateRef.current);
+          if (
+            prev.currentToken === nextView.currentToken &&
+            prev.previousToken === nextView.previousToken &&
+            prev.lastAction === nextView.lastAction &&
+            prev.updatedAt === nextView.updatedAt
+          ) {
+            return prev;
+          }
+
+          return nextView;
+        });
+      };
+
+      const pollId = window.setInterval(() => {
+        pollSnapshot().catch((error) => {
+          console.error('Failed to refresh queue snapshot:', error);
+        });
+      }, 5000);
+
+      channel.subscribe((status) => {
+        if (!alive) return;
+        setRealtimeStatus(formatRealtimeStatus(status));
+
+        if (status === 'SUBSCRIBED') {
+          syncPatientPresence();
+        }
+      });
+
+      return () => {
+        alive = false;
+        window.clearInterval(pollId);
+        channel.untrack().catch(() => {});
+        supabase.removeChannel(channel);
+        channelRef.current = null;
+      };
+    }
+
+    const socket = io(window.location.origin, {
+      autoConnect: true,
+      transports: ['websocket', 'polling'],
     });
 
-    channelRef.current = channel;
+    socketRef.current = socket;
+    setRealtimeStatus('connecting');
 
-    channel.on('postgres_changes', { event: '*', schema: 'public', table: QUEUE_TABLE }, (payload) => {
-      const nextSnapshot = payload.new?.state;
-      if (!alive || !nextSnapshot) return;
-      setQueueState(buildQueueViewState(nextSnapshot, presenceStateRef.current));
-    });
-
-    channel.on('presence', { event: 'sync' }, () => {
-      if (!alive) return;
-      const activePatients = derivePatientsFromPresence(channel.presenceState(), queueStateRef.current.currentToken);
-      presenceStateRef.current = channel.presenceState();
-      setQueueState((prev) => ({
-        ...prev,
-        activePatients,
-        activeCount: activePatients.length,
-      }));
-    });
-
-    const syncPatientPresence = async () => {
+    const syncPatientPresence = () => {
       const token = normalizeTokenValue(patientTokenRef.current);
       if (token === null) return;
-
-      try {
-        await channel.track({ tokenNumber: token, role: 'patient' });
-      } catch (error) {
-        console.error('Failed to track patient presence:', error);
-      }
+      socket.emit('patient:register', { tokenNumber: token, role: 'patient' });
     };
 
-    const bootstrap = async () => {
-      try {
-        const snapshot = (await loadQueueSnapshot()) ?? createQueueViewState();
-        if (!alive) return;
-        setQueueState(buildQueueViewState(snapshot, presenceStateRef.current));
+    socket.on('queue:state', (snapshot) => {
+      if (!alive || !snapshot) return;
+      presenceStateRef.current = {};
+      setQueueState(buildQueueViewState(snapshot));
+    });
 
-        if (!snapshot.updatedAt) {
-          await persistQueueSnapshot(snapshot);
-        }
-      } catch (error) {
-        console.error('Failed to bootstrap queue state:', error);
-      }
-    };
-
-    bootstrap();
-
-    channel.subscribe((status) => {
+    socket.on('connect', () => {
       if (!alive) return;
-      setRealtimeStatus(formatRealtimeStatus(status));
+      setRealtimeStatus('connected');
+      syncPatientPresence();
+    });
 
-      if (status === 'SUBSCRIBED') {
-        syncPatientPresence();
-      }
+    socket.on('disconnect', () => {
+      if (!alive) return;
+      setRealtimeStatus('connecting');
+    });
+
+    socket.on('connect_error', () => {
+      if (!alive) return;
+      setRealtimeStatus('error');
     });
 
     return () => {
       alive = false;
-      channel.untrack().catch(() => {});
-      supabase.removeChannel(channel);
-      channelRef.current = null;
+      socket.off('queue:state');
+      socket.off('connect');
+      socket.off('disconnect');
+      socket.off('connect_error');
+      socket.disconnect();
+      socketRef.current = null;
     };
   }, []);
 
@@ -335,15 +428,22 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const channel = channelRef.current;
-    if (!channel || realtimeStatus !== 'connected') return;
-
     const token = normalizeTokenValue(patientToken);
     if (token === null) return;
 
-    channel.track({ tokenNumber: token, role: 'patient' }).catch((error) => {
-      console.error('Failed to update patient presence:', error);
-    });
+    if (isSupabaseConfigured) {
+      const channel = channelRef.current;
+      if (!channel || realtimeStatus !== 'connected') return;
+
+      channel.track({ tokenNumber: token, role: 'patient' }).catch((error) => {
+        console.error('Failed to update patient presence:', error);
+      });
+      return;
+    }
+
+    const socket = socketRef.current;
+    if (!socket || realtimeStatus !== 'connected') return;
+    socket.emit('patient:register', { tokenNumber: token, role: 'patient' });
   }, [patientToken, realtimeStatus]);
 
   function navigate(path) {
@@ -382,12 +482,19 @@ function App() {
     localStorage.setItem(PATIENT_TOKEN_KEY, String(tokenNumber));
     setPatientMessage(`Watching token ${tokenNumber}.`);
 
-    const channel = channelRef.current;
-    if (channel && realtimeStatus === 'connected') {
-      try {
-        await channel.track({ tokenNumber, role: 'patient' });
-      } catch (error) {
-        console.error('Failed to track patient token:', error);
+    if (isSupabaseConfigured) {
+      const channel = channelRef.current;
+      if (channel && realtimeStatus === 'connected') {
+        try {
+          await channel.track({ tokenNumber, role: 'patient' });
+        } catch (error) {
+          console.error('Failed to track patient token:', error);
+        }
+      }
+    } else {
+      const socket = socketRef.current;
+      if (socket && realtimeStatus === 'connected') {
+        socket.emit('patient:register', { tokenNumber, role: 'patient' });
       }
     }
 
@@ -411,13 +518,30 @@ function App() {
 
     setQueueState(buildQueueViewState(nextSnapshot, presenceStateRef.current));
 
-    if (!isSupabaseConfigured) return;
+    if (isSupabaseConfigured) {
+      try {
+        await persistQueueSnapshot(nextSnapshot);
+      } catch (error) {
+        console.error('Failed to persist queue snapshot:', error);
+        setDoctorAuthMessage('Could not save the queue state to Supabase.');
+      }
+      return;
+    }
 
-    try {
-      await persistQueueSnapshot(nextSnapshot);
-    } catch (error) {
-      console.error('Failed to persist queue snapshot:', error);
-      setDoctorAuthMessage('Could not save the queue state to Supabase.');
+    const socket = socketRef.current;
+    if (!socket || realtimeStatus !== 'connected') return;
+
+    const payload = { tokenNumber };
+    if (action === 'set') {
+      socket.emit('queue:set', payload);
+    } else if (action === 'next') {
+      socket.emit('queue:next');
+    } else if (action === 'skip') {
+      socket.emit('queue:skip');
+    } else if (action === 'recall') {
+      socket.emit('queue:recall');
+    } else if (action === 'reset') {
+      socket.emit('queue:reset');
     }
   }
 
