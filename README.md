@@ -14,9 +14,12 @@ Open `http://localhost:3000`.
 
 ```bash
 VITE_DOCTOR_PASSWORD=100
+VITE_SOCKET_URL=http://localhost:3000
 ```
 
 The doctor dashboard at `/doctor` is password protected. The patient view at `/patient` stays open.
+
+For local development, `VITE_SOCKET_URL` can stay unset because the frontend will connect to the same origin. For Vercel, point `VITE_SOCKET_URL` at a deployed Socket.IO backend, because Vercel serves the React app but does not run the long-lived `server/index.js` process.
 
 ## Routes
 

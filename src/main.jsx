@@ -3,7 +3,12 @@ import { createRoot } from 'react-dom/client';
 import { io } from 'socket.io-client';
 import './styles.css';
 
-const socket = io();
+const SOCKET_URL = String(import.meta.env.VITE_SOCKET_URL ?? '').trim() || window.location.origin;
+const SOCKET_PATH = String(import.meta.env.VITE_SOCKET_PATH ?? '').trim() || '/socket.io';
+const socket = io(SOCKET_URL, {
+  path: SOCKET_PATH,
+  transports: ['websocket', 'polling'],
+});
 const DOCTOR_PASSWORD = String(import.meta.env.VITE_DOCTOR_PASSWORD ?? '100').trim();
 const DOCTOR_UNLOCK_KEY = 'qalert:doctorUnlocked';
 
@@ -12,6 +17,7 @@ function App() {
   const [doctorUnlocked, setDoctorUnlocked] = useState(() => sessionStorage.getItem(DOCTOR_UNLOCK_KEY) === '1');
   const [doctorPassword, setDoctorPassword] = useState('');
   const [doctorAuthMessage, setDoctorAuthMessage] = useState('Enter the doctor password to open the dashboard.');
+  const [connectionStatus, setConnectionStatus] = useState(socket.connected ? 'connected' : 'connecting');
   const [state, setState] = useState({
     currentToken: null,
     previousToken: null,
@@ -73,6 +79,22 @@ function App() {
     const saved = localStorage.getItem('qalert:patientToken');
     if (!saved) return;
     socket.emit('patient:register', { tokenNumber: Number(saved) });
+  }, []);
+
+  useEffect(() => {
+    const handleConnect = () => setConnectionStatus('connected');
+    const handleDisconnect = () => setConnectionStatus('disconnected');
+    const handleConnectError = () => setConnectionStatus('connecting');
+
+    socket.on('connect', handleConnect);
+    socket.on('disconnect', handleDisconnect);
+    socket.on('connect_error', handleConnectError);
+
+    return () => {
+      socket.off('connect', handleConnect);
+      socket.off('disconnect', handleDisconnect);
+      socket.off('connect_error', handleConnectError);
+    };
   }, []);
 
   function navigate(path) {
@@ -173,16 +195,17 @@ function App() {
   }
 
   return (
-    <LandingRoute
-      navigate={navigate}
-      currentToken={state.currentToken}
-      activeCount={state.activeCount}
-      lastAction={state.lastAction}
-    />
-  );
-}
+      <LandingRoute
+        navigate={navigate}
+        currentToken={state.currentToken}
+        activeCount={state.activeCount}
+        lastAction={state.lastAction}
+        connectionStatus={connectionStatus}
+      />
+    );
+  }
 
-function LandingRoute({ navigate, currentToken, activeCount, lastAction }) {
+function LandingRoute({ navigate, currentToken, activeCount, lastAction, connectionStatus }) {
   return (
     <div className="route-shell landing-shell">
       <div className="landing-card">
@@ -204,6 +227,10 @@ function LandingRoute({ navigate, currentToken, activeCount, lastAction }) {
           <div>
             <span>Status</span>
             <strong>{lastAction}</strong>
+          </div>
+          <div>
+            <span>Realtime</span>
+            <strong>{connectionStatus}</strong>
           </div>
         </div>
 
