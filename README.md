@@ -14,12 +14,50 @@ Open `http://localhost:3000`.
 
 ```bash
 VITE_DOCTOR_PASSWORD=100
-VITE_SOCKET_URL=http://localhost:3000
+VITE_SUPABASE_URL=https://your-project.supabase.co
+VITE_SUPABASE_PUBLISHABLE_KEY=your-publishable-key
 ```
 
 The doctor dashboard at `/doctor` is password protected. The patient view at `/patient` stays open.
 
-For local development, `VITE_SOCKET_URL` can stay unset because the frontend will connect to the same origin. For Vercel, point `VITE_SOCKET_URL` at a deployed Socket.IO backend, because Vercel serves the React app but does not run the long-lived `server/index.js` process.
+For Vercel, the frontend now talks directly to Supabase Realtime, so you do not need a separate Socket.IO backend.
+
+## Supabase Setup
+
+Create a table named `queue_state` with a single row:
+
+```sql
+create table if not exists public.queue_state (
+  id bigint primary key,
+  state jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.queue_state enable row level security;
+
+create policy "allow public read"
+on public.queue_state
+for select
+to anon
+using (true);
+
+create policy "allow public write"
+on public.queue_state
+for insert
+to anon
+with check (true);
+
+create policy "allow public update"
+on public.queue_state
+for update
+to anon
+using (true)
+with check (true);
+
+alter publication supabase_realtime add table public.queue_state;
+```
+
+The app upserts row `id = 1` and listens for realtime changes on that table.
 
 ## Routes
 
